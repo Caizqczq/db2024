@@ -22,7 +22,11 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
     {
         // 处理表名
         query->tables = std::move(x->tabs);
-        /** TODO: 检查表是否存在 */
+        for (auto &tab_name : query->tables) {
+            if (!sm_manager_->db_.is_table(tab_name)) {
+                throw TableNotFoundError(tab_name);
+            }
+        }
 
         // 处理target list，再target list中添加上表名，例如 a.id
         for (auto &sv_sel_col : x->cols) {
@@ -48,13 +52,51 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
         get_clause(x->conds, query->conds);
         check_clause(query->tables, query->conds);
     } else if (auto x = std::dynamic_pointer_cast<ast::UpdateStmt>(parse)) {
-        /** TODO: */
+        if (!sm_manager_->db_.is_table(x->tab_name)) {
+            throw TableNotFoundError(x->tab_name);
+        }
+        query->tables = {x->tab_name};
+        std::vector<ColMeta> all_cols;
+        get_all_cols(query->tables, all_cols);
+
+        get_clause(x->conds, query->conds);
+        check_clause(query->tables, query->conds);
+
+        for (auto &sv_set_clause : x->set_clauses) {
+            SetClause set_clause;
+            set_clause.lhs = {.tab_name = x->tab_name, .col_name = sv_set_clause->col_name};
+            set_clause.lhs = check_column(all_cols, set_clause.lhs);
+
+            set_clause.rhs = convert_sv_value(sv_set_clause->val);
+            auto col_meta = sm_manager_->db_.get_table(set_clause.lhs.tab_name).get_col(set_clause.lhs.col_name);
+            if (set_clause.rhs.type != col_meta->type) {
+                bool lhs_numeric = col_meta->type == TYPE_INT || col_meta->type == TYPE_FLOAT;
+                bool rhs_numeric = set_clause.rhs.type == TYPE_INT || set_clause.rhs.type == TYPE_FLOAT;
+                if (lhs_numeric && rhs_numeric) {
+                    if (col_meta->type == TYPE_FLOAT && set_clause.rhs.type == TYPE_INT) {
+                        set_clause.rhs.set_float(static_cast<float>(set_clause.rhs.int_val));
+                    } else if (col_meta->type == TYPE_INT && set_clause.rhs.type == TYPE_FLOAT) {
+                        set_clause.rhs.set_int(static_cast<int>(set_clause.rhs.float_val));
+                    }
+                } else {
+                    throw IncompatibleTypeError(coltype2str(col_meta->type), coltype2str(set_clause.rhs.type));
+                }
+            }
+            set_clause.rhs.init_raw(col_meta->len);
+            query->set_clauses.push_back(set_clause);
+        }
 
     } else if (auto x = std::dynamic_pointer_cast<ast::DeleteStmt>(parse)) {
+        if (!sm_manager_->db_.is_table(x->tab_name)) {
+            throw TableNotFoundError(x->tab_name);
+        }
         //处理where条件
         get_clause(x->conds, query->conds);
         check_clause({x->tab_name}, query->conds);        
     } else if (auto x = std::dynamic_pointer_cast<ast::InsertStmt>(parse)) {
+        if (!sm_manager_->db_.is_table(x->tab_name)) {
+            throw TableNotFoundError(x->tab_name);
+        }
         // 处理insert 的values值
         for (auto &sv_val : x->vals) {
             query->values.push_back(convert_sv_value(sv_val));
@@ -84,8 +126,16 @@ TabCol Analyze::check_column(const std::vector<ColMeta> &all_cols, TabCol target
         }
         target.tab_name = tab_name;
     } else {
-        /** TODO: Make sure target column exists */
-        
+        bool found = false;
+        for (auto &col : all_cols) {
+            if (col.tab_name == target.tab_name && col.name == target.col_name) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            throw ColumnNotFoundError(target.tab_name + "." + target.col_name);
+        }
     }
     return target;
 }
@@ -139,7 +189,20 @@ void Analyze::check_clause(const std::vector<std::string> &tab_names, std::vecto
             rhs_type = rhs_col->type;
         }
         if (lhs_type != rhs_type) {
-            throw IncompatibleTypeError(coltype2str(lhs_type), coltype2str(rhs_type));
+            bool lhs_numeric = lhs_type == TYPE_INT || lhs_type == TYPE_FLOAT;
+            bool rhs_numeric = rhs_type == TYPE_INT || rhs_type == TYPE_FLOAT;
+            if (!(lhs_numeric && rhs_numeric)) {
+                throw IncompatibleTypeError(coltype2str(lhs_type), coltype2str(rhs_type));
+            }
+            if (cond.is_rhs_val) {
+                if (lhs_type == TYPE_FLOAT && cond.rhs_val.type == TYPE_INT) {
+                    cond.rhs_val.set_float(static_cast<float>(cond.rhs_val.int_val));
+                } else if (lhs_type == TYPE_INT && cond.rhs_val.type == TYPE_FLOAT) {
+                    cond.rhs_val.set_int(static_cast<int>(cond.rhs_val.float_val));
+                }
+                cond.rhs_val.raw = nullptr;
+                cond.rhs_val.init_raw(lhs_col->len);
+            }
         }
     }
 }

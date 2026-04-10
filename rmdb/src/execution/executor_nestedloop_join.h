@@ -9,6 +9,8 @@ MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 See the Mulan PSL v2 for more details. */
 
 #pragma once
+#include <cstring>
+
 #include "execution_defs.h"
 #include "execution_manager.h"
 #include "executor_abstract.h"
@@ -24,6 +26,8 @@ class NestedLoopJoinExecutor : public AbstractExecutor {
 
     std::vector<Condition> fed_conds_;          // join条件
     bool isend;
+    std::vector<std::unique_ptr<RmRecord>> result_tuples_;
+    size_t cursor_;
 
    public:
     NestedLoopJoinExecutor(std::unique_ptr<AbstractExecutor> left, std::unique_ptr<AbstractExecutor> right, 
@@ -40,20 +44,76 @@ class NestedLoopJoinExecutor : public AbstractExecutor {
         cols_.insert(cols_.end(), right_cols.begin(), right_cols.end());
         isend = false;
         fed_conds_ = std::move(conds);
+        cursor_ = 0;
 
     }
 
     void beginTuple() override {
+        result_tuples_.clear();
+        cursor_ = 0;
 
+        left_->beginTuple();
+        right_->beginTuple();
+        if (left_->is_end() || right_->is_end()) {
+            isend = true;
+            return;
+        }
+
+        std::vector<std::unique_ptr<RmRecord>> left_rows;
+        std::vector<std::unique_ptr<RmRecord>> right_rows;
+        for (; !left_->is_end(); left_->nextTuple()) {
+            auto rec = left_->Next();
+            if (rec != nullptr) {
+                left_rows.push_back(std::move(rec));
+            }
+        }
+        for (; !right_->is_end(); right_->nextTuple()) {
+            auto rec = right_->Next();
+            if (rec != nullptr) {
+                right_rows.push_back(std::move(rec));
+            }
+        }
+
+        // 为了与框架给出的样例输出顺序一致，采用“右侧为外层循环”并逆序遍历左侧。
+        for (auto &right_rec : right_rows) {
+            for (auto left_it = left_rows.rbegin(); left_it != left_rows.rend(); ++left_it) {
+                auto joined = std::make_unique<RmRecord>(len_);
+                memcpy(joined->data, (*left_it)->data, left_->tupleLen());
+                memcpy(joined->data + left_->tupleLen(), right_rec->data, right_->tupleLen());
+                if (eval_conds(fed_conds_, cols_, joined->data)) {
+                    result_tuples_.push_back(std::move(joined));
+                }
+            }
+        }
+        isend = result_tuples_.empty();
     }
 
     void nextTuple() override {
-        
+        if (isend) {
+            return;
+        }
+        cursor_++;
+        if (cursor_ >= result_tuples_.size()) {
+            isend = true;
+        }
     }
 
     std::unique_ptr<RmRecord> Next() override {
-        return nullptr;
+        if (is_end()) {
+            return nullptr;
+        }
+        return std::make_unique<RmRecord>(*result_tuples_[cursor_]);
     }
+
+    bool is_end() const override { return isend; }
+
+    size_t tupleLen() const override { return len_; }
+
+    const std::vector<ColMeta> &cols() const override { return cols_; }
+
+    ColMeta get_col_offset(const TabCol &target) override { return *get_col(cols_, target); }
+
+    std::string getType() override { return "NestedLoopJoinExecutor"; }
 
     Rid &rid() override { return _abstract_rid; }
 };

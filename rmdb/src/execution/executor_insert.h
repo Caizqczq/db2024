@@ -44,7 +44,20 @@ class InsertExecutor : public AbstractExecutor {
             auto &col = tab_.cols[i];
             auto &val = values_[i];
             if (col.type != val.type) {
-                throw IncompatibleTypeError(coltype2str(col.type), coltype2str(val.type));
+                bool lhs_numeric = col.type == TYPE_INT || col.type == TYPE_FLOAT;
+                bool rhs_numeric = val.type == TYPE_INT || val.type == TYPE_FLOAT;
+                if (lhs_numeric && rhs_numeric) {
+                    if (col.type == TYPE_FLOAT && val.type == TYPE_INT) {
+                        val.set_float(static_cast<float>(val.int_val));
+                    } else if (col.type == TYPE_INT && val.type == TYPE_FLOAT) {
+                        val.set_int(static_cast<int>(val.float_val));
+                    }
+                } else {
+                    throw IncompatibleTypeError(coltype2str(col.type), coltype2str(val.type));
+                }
+            }
+            if (val.raw != nullptr) {
+                val.raw = nullptr;
             }
             val.init_raw(col.len);
             memcpy(rec.data + col.offset, val.raw->data, col.len);
@@ -56,15 +69,16 @@ class InsertExecutor : public AbstractExecutor {
         for(size_t i = 0; i < tab_.indexes.size(); ++i) {
             auto& index = tab_.indexes[i];
             auto ih = sm_manager_->ihs_.at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols)).get();
-            char* key = new char[index.col_tot_len];
+            std::vector<char> key(index.col_tot_len);
             int offset = 0;
-            for(size_t i = 0; i < index.col_num; ++i) {
-                memcpy(key + offset, rec.data + index.cols[i].offset, index.cols[i].len);
-                offset += index.cols[i].len;
+            for(size_t j = 0; j < static_cast<size_t>(index.col_num); ++j) {
+                memcpy(key.data() + offset, rec.data + index.cols[j].offset, index.cols[j].len);
+                offset += index.cols[j].len;
             }
-            ih->insert_entry(key, rid_, context_->txn_);
+            ih->insert_entry(key.data(), rid_, context_->txn_);
         }
         return nullptr;
     }
+    std::string getType() override { return "InsertExecutor"; }
     Rid &rid() override { return rid_; }
 };
