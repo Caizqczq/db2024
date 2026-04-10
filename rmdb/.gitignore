@@ -1,0 +1,47 @@
+# ===== CMake / 构建目录 =====
+/build/
+/build-*/
+/out/
+/cmake-build-*/
+build/
+cmake-build-*/
+/CMakeFiles/
+/CMakeCache.txt
+/cmake_install.cmake
+/CTestTestfile.cmake
+/Testing/
+/install_manifest.txt
+/compile_commands.json
+/Makefile
+
+# ===== in-source 构建输出 =====
+/bin/
+/lib/
+
+# ===== C/C++ 编译产物 =====
+*.o
+*.obj
+*.lo
+*.a
+*.lib
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+
+# ===== 调试/临时文件 =====
+*.dSYM/
+*.gch
+*.pch
+*.core
+core.*
+*~
+.DS_Store
+
+# ===== 打包脚本与打包产物 =====
+/package_zip.sh
+/*.zip
+
+# ===== 本地工具临时文件 =====
+/.codex
