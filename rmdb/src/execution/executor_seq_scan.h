@@ -82,7 +82,7 @@ class SeqScanExecutor : public AbstractExecutor {
         while (scan_ != nullptr && !scan_->is_end()) {
             Rid curr_rid = scan_->rid();
             auto rec = fh_->get_record(curr_rid, context_);
-            if (eval_conds(fed_conds_, cols_, rec->data)) {
+            if (evaluate_conditions(cols_, rec.get(), fed_conds_)) {
                 rid_ = curr_rid;
                 return;
             }

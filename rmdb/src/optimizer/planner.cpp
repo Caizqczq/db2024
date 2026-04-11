@@ -22,16 +22,180 @@ See the Mulan PSL v2 for more details. */
 #include "index/ix.h"
 #include "record_printer.h"
 
-// 目前的索引匹配规则为：完全匹配索引字段，且全部为单点查询，不会自动调整where条件的顺序
-bool Planner::get_index_cols(std::string tab_name, std::vector<Condition> curr_conds, std::vector<std::string>& index_col_names) {
-    index_col_names.clear();
-    for(auto& cond: curr_conds) {
-        if(cond.is_rhs_val && cond.op == OP_EQ && cond.lhs_col.tab_name.compare(tab_name) == 0)
-            index_col_names.push_back(cond.lhs_col.col_name);
+namespace {
+bool condition_matches_column(const Condition &cond, const std::string &tab_name, const std::string &col_name) {
+    return cond.is_rhs_val && cond.lhs_col.tab_name == tab_name && cond.lhs_col.col_name == col_name;
+}
+
+bool better_lower_bound(const Value &candidate, bool inclusive, bool &has_lower, Value &current,
+                        bool &current_inclusive, ColType type, int len) {
+    if (!has_lower) {
+        has_lower = true;
+        current = candidate;
+        current_inclusive = inclusive;
+        return true;
     }
-    TabMeta& tab = sm_manager_->db_.get_table(tab_name);
-    if(tab.is_index(index_col_names)) return true;
+    auto candidate_copy = candidate;
+    auto current_copy = current;
+    if (!candidate_copy.raw) {
+        candidate_copy.init_raw(len);
+    }
+    if (!current_copy.raw) {
+        current_copy.init_raw(len);
+    }
+    int cmp = ix_compare(candidate_copy.raw->data, current_copy.raw->data, type, len);
+    if (cmp > 0 || (cmp == 0 && !inclusive && current_inclusive)) {
+        current = candidate;
+        current_inclusive = inclusive;
+        return true;
+    }
     return false;
+}
+
+bool better_upper_bound(const Value &candidate, bool inclusive, bool &has_upper, Value &current,
+                        bool &current_inclusive, ColType type, int len) {
+    if (!has_upper) {
+        has_upper = true;
+        current = candidate;
+        current_inclusive = inclusive;
+        return true;
+    }
+    auto candidate_copy = candidate;
+    auto current_copy = current;
+    if (!candidate_copy.raw) {
+        candidate_copy.init_raw(len);
+    }
+    if (!current_copy.raw) {
+        current_copy.init_raw(len);
+    }
+    int cmp = ix_compare(candidate_copy.raw->data, current_copy.raw->data, type, len);
+    if (cmp < 0 || (cmp == 0 && !inclusive && current_inclusive)) {
+        current = candidate;
+        current_inclusive = inclusive;
+        return true;
+    }
+    return false;
+}
+
+struct IndexChoice {
+    bool usable = false;
+    std::vector<std::string> col_names;
+    std::vector<IndexRange> ranges;
+    int matched_cols = 0;
+    int eq_prefix = 0;
+};
+
+bool is_better_choice(const IndexChoice &lhs, const IndexChoice &rhs) {
+    if (!lhs.usable) {
+        return false;
+    }
+    if (!rhs.usable) {
+        return true;
+    }
+    if (lhs.matched_cols != rhs.matched_cols) {
+        return lhs.matched_cols > rhs.matched_cols;
+    }
+    if (lhs.eq_prefix != rhs.eq_prefix) {
+        return lhs.eq_prefix > rhs.eq_prefix;
+    }
+    return lhs.col_names.size() < rhs.col_names.size();
+}
+}  // namespace
+
+bool Planner::get_index_scan_info(std::string tab_name, const std::vector<Condition> &curr_conds,
+                                  std::vector<std::string> &index_col_names, std::vector<IndexRange> &index_ranges) {
+    index_col_names.clear();
+    index_ranges.clear();
+
+    if (curr_conds.empty()) {
+        return false;
+    }
+
+    TabMeta &tab = sm_manager_->db_.get_table(tab_name);
+    IndexChoice best_choice;
+
+    for (const auto &index : tab.indexes) {
+        IndexChoice choice;
+        for (const auto &col : index.cols) {
+            choice.col_names.push_back(col.name);
+        }
+        choice.ranges.reserve(index.col_num);
+
+        for (const auto &col : index.cols) {
+            IndexRange range;
+            range.col_name = col.name;
+
+            bool has_eq = false;
+            Value eq_value;
+            Value lower_value;
+            Value upper_value;
+            bool has_lower = false;
+            bool has_upper = false;
+            bool lower_inclusive = true;
+            bool upper_inclusive = true;
+
+            for (const auto &cond : curr_conds) {
+                if (!condition_matches_column(cond, tab_name, col.name)) {
+                    continue;
+                }
+
+                if (cond.op == OP_EQ) {
+                    has_eq = true;
+                    eq_value = cond.rhs_val;
+                    break;
+                }
+
+                if (cond.op == OP_GT || cond.op == OP_GE) {
+                    better_lower_bound(cond.rhs_val, cond.op == OP_GE, has_lower, lower_value, lower_inclusive,
+                                       col.type, col.len);
+                } else if (cond.op == OP_LT || cond.op == OP_LE) {
+                    better_upper_bound(cond.rhs_val, cond.op == OP_LE, has_upper, upper_value, upper_inclusive,
+                                       col.type, col.len);
+                }
+            }
+
+            if (has_eq) {
+                range.has_lower = true;
+                range.lower_inclusive = true;
+                range.lower_value = eq_value;
+                range.has_upper = true;
+                range.upper_inclusive = true;
+                range.upper_value = eq_value;
+                range.has_equality = true;
+                choice.eq_prefix++;
+                choice.matched_cols++;
+                choice.ranges.push_back(range);
+                continue;
+            }
+
+            if (has_lower || has_upper) {
+                range.has_lower = has_lower;
+                range.lower_inclusive = lower_inclusive;
+                range.lower_value = lower_value;
+                range.has_upper = has_upper;
+                range.upper_inclusive = upper_inclusive;
+                range.upper_value = upper_value;
+                choice.matched_cols++;
+                choice.ranges.push_back(range);
+                break;
+            }
+
+            break;
+        }
+
+        choice.usable = choice.matched_cols > 0;
+        if (is_better_choice(choice, best_choice)) {
+            best_choice = std::move(choice);
+        }
+    }
+
+    if (!best_choice.usable) {
+        return false;
+    }
+
+    index_col_names = std::move(best_choice.col_names);
+    index_ranges = std::move(best_choice.ranges);
+    return true;
 }
 
 /**
@@ -149,14 +313,16 @@ std::shared_ptr<Plan> Planner::make_one_rel(std::shared_ptr<Query> query)
         auto curr_conds = pop_conds(query->conds, tables[i]);
         // int index_no = get_indexNo(tables[i], curr_conds);
         std::vector<std::string> index_col_names;
-        bool index_exist = get_index_cols(tables[i], curr_conds, index_col_names);
+        std::vector<IndexRange> index_ranges;
+        bool index_exist = get_index_scan_info(tables[i], curr_conds, index_col_names, index_ranges);
         if (index_exist == false) {  // 该表没有索引
             index_col_names.clear();
+            index_ranges.clear();
             table_scan_executors[i] = 
-                std::make_shared<ScanPlan>(T_SeqScan, sm_manager_, tables[i], curr_conds, index_col_names);
+                std::make_shared<ScanPlan>(T_SeqScan, sm_manager_, tables[i], curr_conds, index_col_names, index_ranges);
         } else {  // 存在索引
             table_scan_executors[i] =
-                std::make_shared<ScanPlan>(T_IndexScan, sm_manager_, tables[i], curr_conds, index_col_names);
+                std::make_shared<ScanPlan>(T_IndexScan, sm_manager_, tables[i], curr_conds, index_col_names, index_ranges);
         }
     }
     // 只有一个表，不需要join。
@@ -332,6 +498,8 @@ std::shared_ptr<Plan> Planner::do_planner(std::shared_ptr<Query> query, Context 
     } else if (auto x = std::dynamic_pointer_cast<ast::DropIndex>(query->parse)) {
         // drop index
         plannerRoot = std::make_shared<DDLPlan>(T_DropIndex, x->tab_name, x->col_names, std::vector<ColDef>());
+    } else if (auto x = std::dynamic_pointer_cast<ast::ShowIndex>(query->parse)) {
+        plannerRoot = std::make_shared<OtherPlan>(T_ShowIndex, x->tab_name);
     } else if (auto x = std::dynamic_pointer_cast<ast::InsertStmt>(query->parse)) {
         // insert;
         plannerRoot = std::make_shared<DMLPlan>(T_Insert, std::shared_ptr<Plan>(),  x->tab_name,  
@@ -343,15 +511,17 @@ std::shared_ptr<Plan> Planner::do_planner(std::shared_ptr<Query> query, Context 
         // 只有一张表，不需要进行物理优化了
         // int index_no = get_indexNo(x->tab_name, query->conds);
         std::vector<std::string> index_col_names;
-        bool index_exist = get_index_cols(x->tab_name, query->conds, index_col_names);
+        std::vector<IndexRange> index_ranges;
+        bool index_exist = get_index_scan_info(x->tab_name, query->conds, index_col_names, index_ranges);
         
         if (index_exist == false) {  // 该表没有索引
             index_col_names.clear();
+            index_ranges.clear();
             table_scan_executors = 
-                std::make_shared<ScanPlan>(T_SeqScan, sm_manager_, x->tab_name, query->conds, index_col_names);
+                std::make_shared<ScanPlan>(T_SeqScan, sm_manager_, x->tab_name, query->conds, index_col_names, index_ranges);
         } else {  // 存在索引
             table_scan_executors =
-                std::make_shared<ScanPlan>(T_IndexScan, sm_manager_, x->tab_name, query->conds, index_col_names);
+                std::make_shared<ScanPlan>(T_IndexScan, sm_manager_, x->tab_name, query->conds, index_col_names, index_ranges);
         }
 
         plannerRoot = std::make_shared<DMLPlan>(T_Delete, table_scan_executors, x->tab_name,  
@@ -363,15 +533,17 @@ std::shared_ptr<Plan> Planner::do_planner(std::shared_ptr<Query> query, Context 
         // 只有一张表，不需要进行物理优化了
         // int index_no = get_indexNo(x->tab_name, query->conds);
         std::vector<std::string> index_col_names;
-        bool index_exist = get_index_cols(x->tab_name, query->conds, index_col_names);
+        std::vector<IndexRange> index_ranges;
+        bool index_exist = get_index_scan_info(x->tab_name, query->conds, index_col_names, index_ranges);
 
         if (index_exist == false) {  // 该表没有索引
-        index_col_names.clear();
+            index_col_names.clear();
+            index_ranges.clear();
             table_scan_executors = 
-                std::make_shared<ScanPlan>(T_SeqScan, sm_manager_, x->tab_name, query->conds, index_col_names);
+                std::make_shared<ScanPlan>(T_SeqScan, sm_manager_, x->tab_name, query->conds, index_col_names, index_ranges);
         } else {  // 存在索引
             table_scan_executors =
-                std::make_shared<ScanPlan>(T_IndexScan, sm_manager_, x->tab_name, query->conds, index_col_names);
+                std::make_shared<ScanPlan>(T_IndexScan, sm_manager_, x->tab_name, query->conds, index_col_names, index_ranges);
         }
         plannerRoot = std::make_shared<DMLPlan>(T_Update, table_scan_executors, x->tab_name,
                                                      std::vector<Value>(), query->conds, 

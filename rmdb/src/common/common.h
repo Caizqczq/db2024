@@ -86,3 +86,14 @@ struct SetClause {
     TabCol lhs;
     Value rhs;
 };
+
+struct IndexRange {
+    std::string col_name;
+    bool has_lower = false;
+    bool lower_inclusive = true;
+    Value lower_value;
+    bool has_upper = false;
+    bool upper_inclusive = true;
+    Value upper_value;
+    bool has_equality = false;
+};

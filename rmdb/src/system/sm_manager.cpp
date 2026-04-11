@@ -20,6 +20,38 @@ See the Mulan PSL v2 for more details. */
 #include "record/rm.h"
 #include "record_printer.h"
 
+namespace {
+std::vector<char> build_index_key(const IndexMeta &index, const RmRecord &record) {
+    std::vector<char> key(index.col_tot_len);
+    int offset = 0;
+    for (const auto &col : index.cols) {
+        memcpy(key.data() + offset, record.data + col.offset, col.len);
+        offset += col.len;
+    }
+    return key;
+}
+
+void append_context_line(Context *context, const std::string &line) {
+    if (context == nullptr || context->data_send_ == nullptr || context->offset_ == nullptr) {
+        return;
+    }
+    memcpy(context->data_send_ + *context->offset_, line.c_str(), line.size());
+    *context->offset_ += static_cast<int>(line.size());
+}
+
+std::string format_index_columns(const std::vector<ColMeta> &cols) {
+    std::string result = "(";
+    for (size_t i = 0; i < cols.size(); ++i) {
+        if (i > 0) {
+            result += ",";
+        }
+        result += cols[i].name;
+    }
+    result += ")";
+    return result;
+}
+}  // namespace
+
 /**
  * @description: 判断是否为一个文件夹
  * @return {bool} 返回是否为一个文件夹
@@ -167,6 +199,18 @@ void SmManager::show_tables(Context* context) {
     outfile.close();
 }
 
+void SmManager::show_index(const std::string &tab_name, Context *context) {
+    TabMeta &tab = db_.get_table(tab_name);
+    std::fstream outfile;
+    outfile.open("output.txt", std::ios::out | std::ios::app);
+    for (const auto &index : tab.indexes) {
+        std::string line = "| " + tab_name + " | unique | " + format_index_columns(index.cols) + " |\n";
+        append_context_line(context, line);
+        outfile << line;
+    }
+    outfile.close();
+}
+
 /**
  * @description: 显示表的元数据
  * @param {string&} tab_name 表名称
@@ -279,20 +323,24 @@ void SmManager::create_index(const std::string& tab_name, const std::vector<std:
 
     ix_manager_->create_index(tab_name, cols);
     std::string ix_name = ix_manager_->get_index_name(tab_name, cols);
-    ihs_.emplace(ix_name, ix_manager_->open_index(tab_name, cols));
-    auto ih = ihs_.at(ix_name).get();
+    std::unique_ptr<IxIndexHandle> ih = ix_manager_->open_index(tab_name, cols);
     auto fh = fhs_.at(tab_name).get();
 
-    for (RmScan scan(fh); !scan.is_end(); scan.next()) {
-        Rid rid = scan.rid();
-        auto rec = fh->get_record(rid, context);
-        std::vector<char> key(col_tot_len);
-        int offset = 0;
-        for (auto &col : cols) {
-            memcpy(key.data() + offset, rec->data + col.offset, col.len);
-            offset += col.len;
+    try {
+        for (RmScan scan(fh); !scan.is_end(); scan.next()) {
+            Rid rid = scan.rid();
+            auto rec = fh->get_record(rid, context);
+            auto key = build_index_key(IndexMeta{tab_name, col_tot_len, static_cast<int>(cols.size()), cols}, *rec);
+            std::vector<Rid> result;
+            if (ih->get_value(key.data(), &result, context ? context->txn_ : nullptr) && !result.empty()) {
+                throw RMDBError("Duplicate key when creating index");
+            }
+            ih->insert_entry(key.data(), rid, context ? context->txn_ : nullptr);
         }
-        ih->insert_entry(key.data(), rid, context ? context->txn_ : nullptr);
+    } catch (...) {
+        ix_manager_->close_index(ih.get());
+        ix_manager_->destroy_index(tab_name, cols);
+        throw;
     }
 
     IndexMeta index_meta = {.tab_name = tab_name,
@@ -300,6 +348,7 @@ void SmManager::create_index(const std::string& tab_name, const std::vector<std:
                             .col_num = static_cast<int>(cols.size()),
                             .cols = cols};
     tab.indexes.push_back(index_meta);
+    ihs_[ix_name] = std::move(ih);
     for (auto &tab_col : tab.cols) {
         bool indexed = false;
         for (auto &index : tab.indexes) {

@@ -24,6 +24,12 @@ class DeleteExecutor : public AbstractExecutor {
     std::string tab_name_;          // 表名称
     SmManager *sm_manager_;
 
+    struct DeletePlan {
+        Rid rid;
+        RmRecord rec;
+        std::vector<std::vector<char>> keys;
+    };
+
    public:
     DeleteExecutor(SmManager *sm_manager, const std::string &tab_name, std::vector<Condition> conds,
                    std::vector<Rid> rids, Context *context) {
@@ -37,21 +43,39 @@ class DeleteExecutor : public AbstractExecutor {
     }
 
     std::unique_ptr<RmRecord> Next() override {
+        std::vector<DeletePlan> plans;
+        plans.reserve(rids_.size());
+
         for (auto &rid : rids_) {
-            auto rec = fh_->get_record(rid, context_);
+            auto rec_ptr = fh_->get_record(rid, context_);
+            if (rec_ptr == nullptr) {
+                continue;
+            }
+
+            DeletePlan plan{rid, *rec_ptr, {}};
+            plan.keys.reserve(tab_.indexes.size());
             for (auto &index : tab_.indexes) {
-                auto ih = sm_manager_->ihs_
-                              .at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols))
-                              .get();
                 std::vector<char> key(index.col_tot_len);
                 int offset = 0;
                 for (auto &index_col : index.cols) {
-                    memcpy(key.data() + offset, rec->data + index_col.offset, index_col.len);
+                    memcpy(key.data() + offset, plan.rec.data + index_col.offset, index_col.len);
                     offset += index_col.len;
                 }
-                ih->delete_entry(key.data(), context_->txn_);
+                plan.keys.push_back(std::move(key));
             }
-            fh_->delete_record(rid, context_);
+            plans.push_back(std::move(plan));
+        }
+
+        for (auto &plan : plans) {
+            if (context_ != nullptr && context_->txn_ != nullptr) {
+                context_->txn_->append_write_record(new WriteRecord(WType::DELETE_TUPLE, tab_name_, plan.rid, plan.rec));
+            }
+            for (size_t idx = 0; idx < tab_.indexes.size(); ++idx) {
+                auto &index = tab_.indexes[idx];
+                auto ih = sm_manager_->ihs_.at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols)).get();
+                ih->delete_entry(plan.keys[idx].data(), context_ ? context_->txn_ : nullptr);
+            }
+            fh_->delete_record(plan.rid, context_);
         }
         return nullptr;
     }

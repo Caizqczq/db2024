@@ -155,6 +155,12 @@ void *client_handler(void *sock_fd) {
                     // 遇到异常，需要打印failure到output.txt文件中，并发异常信息返回给客户端
                     std::cerr << e.what() << std::endl;
 
+                    // 隐式事务在语句失败时需要回滚，避免出现部分写入
+                    if (context->txn_ != nullptr && context->txn_->get_txn_mode() == false &&
+                        context->txn_->get_state() == TransactionState::GROWING) {
+                        txn_manager->abort(context->txn_, log_manager.get());
+                    }
+
                     memcpy(data_send, e.what(), e.get_msg_len());
                     data_send[e.get_msg_len()] = '\n';
                     data_send[e.get_msg_len() + 1] = '\0';
@@ -178,7 +184,7 @@ void *client_handler(void *sock_fd) {
             break;
         }
         // 如果是单挑语句，需要按照一个完整的事务来执行，所以执行完当前语句后，自动提交事务
-        if(context->txn_->get_txn_mode() == false)
+        if(context->txn_->get_txn_mode() == false && context->txn_->get_state() == TransactionState::GROWING)
         {
             txn_manager->commit(context->txn_, context->log_mgr_);
         }
