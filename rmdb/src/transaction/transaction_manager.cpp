@@ -83,14 +83,15 @@ void TransactionManager::abort(Transaction * txn, LogManager *log_manager) {
             // undo insert: 删除该记录并清理索引项
             auto rec = fh->get_record(rid, nullptr);
             for (auto &index : tab.indexes) {
-                std::string ix_name = sm_manager_->get_ix_manager()->get_index_name(tab_name, index.cols);
-                auto ih_it = sm_manager_->ihs_.find(ix_name);
-                if (ih_it == sm_manager_->ihs_.end()) {
-                    continue;
-                }
+                auto *ih = sm_manager_->open_index_handle(tab_name, index.cols);
                 std::vector<char> key_buf(index.col_tot_len);
                 make_index_key(index.cols, rec->data, key_buf.data());
-                ih_it->second->delete_entry(key_buf.data(), txn);
+                std::vector<Rid> existing;
+                if (ih->get_value(key_buf.data(), &existing, txn) && !existing.empty()) {
+                    if (existing.front().page_no == rid.page_no && existing.front().slot_no == rid.slot_no) {
+                        ih->delete_entry(key_buf.data(), txn);
+                    }
+                }
             }
             fh->delete_record(rid, nullptr);
         } else if (write_record->GetWriteType() == WType::DELETE_TUPLE) {
@@ -98,32 +99,32 @@ void TransactionManager::abort(Transaction * txn, LogManager *log_manager) {
             auto &old_rec = write_record->GetRecord();
             fh->insert_record(rid, old_rec.data);
             for (auto &index : tab.indexes) {
-                std::string ix_name = sm_manager_->get_ix_manager()->get_index_name(tab_name, index.cols);
-                auto ih_it = sm_manager_->ihs_.find(ix_name);
-                if (ih_it == sm_manager_->ihs_.end()) {
-                    continue;
-                }
+                auto *ih = sm_manager_->open_index_handle(tab_name, index.cols);
                 std::vector<char> key_buf(index.col_tot_len);
                 make_index_key(index.cols, old_rec.data, key_buf.data());
-                ih_it->second->insert_entry(key_buf.data(), rid, txn);
+                ih->insert_entry(key_buf.data(), rid, txn);
             }
         } else if (write_record->GetWriteType() == WType::UPDATE_TUPLE) {
             // undo update: 恢复旧值，并更新受影响的索引项
             auto curr_rec = fh->get_record(rid, nullptr);
             auto &old_rec = write_record->GetRecord();
             for (auto &index : tab.indexes) {
-                std::string ix_name = sm_manager_->get_ix_manager()->get_index_name(tab_name, index.cols);
-                auto ih_it = sm_manager_->ihs_.find(ix_name);
-                if (ih_it == sm_manager_->ihs_.end()) {
-                    continue;
-                }
+                auto *ih = sm_manager_->open_index_handle(tab_name, index.cols);
                 std::vector<char> curr_key(index.col_tot_len);
                 std::vector<char> old_key(index.col_tot_len);
                 make_index_key(index.cols, curr_rec->data, curr_key.data());
                 make_index_key(index.cols, old_rec.data, old_key.data());
                 if (std::memcmp(curr_key.data(), old_key.data(), index.col_tot_len) != 0) {
-                    ih_it->second->delete_entry(curr_key.data(), txn);
-                    ih_it->second->insert_entry(old_key.data(), rid, txn);
+                    std::vector<Rid> curr_existing;
+                    if (ih->get_value(curr_key.data(), &curr_existing, txn) && !curr_existing.empty()) {
+                        if (curr_existing.front().page_no == rid.page_no && curr_existing.front().slot_no == rid.slot_no) {
+                            ih->delete_entry(curr_key.data(), txn);
+                        }
+                    }
+                    std::vector<Rid> existing;
+                    if (!ih->get_value(old_key.data(), &existing, txn)) {
+                        ih->insert_entry(old_key.data(), rid, txn);
+                    }
                 }
             }
             fh->update_record(rid, old_rec.data, nullptr);

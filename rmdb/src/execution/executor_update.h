@@ -58,25 +58,24 @@ class UpdateExecutor : public AbstractExecutor {
                 std::memcpy(new_rec.data + col->offset, rhs.raw->data, col->len);
             }
 
+            if (context_->txn_ != nullptr) {
+                context_->txn_->append_write_record(new WriteRecord(WType::UPDATE_TUPLE, tab_name_, rid, *old_rec));
+            }
+
+            // 先更新基表，再维护索引；若索引维护异常，由事务回滚恢复
+            fh_->update_record(rid, new_rec.data, context_);
+
             for (auto &index : tab_.indexes) {
-                std::string ix_name = sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols);
-                auto ih_it = sm_manager_->ihs_.find(ix_name);
-                if (ih_it == sm_manager_->ihs_.end()) {
-                    continue;
-                }
+                auto *ih = sm_manager_->open_index_handle(tab_name_, index.cols);
                 std::vector<char> old_key(index.col_tot_len);
                 std::vector<char> new_key(index.col_tot_len);
                 make_index_key(index.cols, old_rec->data, old_key.data());
                 make_index_key(index.cols, new_rec.data, new_key.data());
-                if (std::memcmp(old_key.data(), new_key.data(), index.col_tot_len) != 0) {
-                    ih_it->second->delete_entry(old_key.data(), context_->txn_);
-                    ih_it->second->insert_entry(new_key.data(), rid, context_->txn_);
+                if (std::memcmp(old_key.data(), new_key.data(), index.col_tot_len) == 0) {
+                    continue;
                 }
-            }
-
-            fh_->update_record(rid, new_rec.data, context_);
-            if (context_->txn_ != nullptr) {
-                context_->txn_->append_write_record(new WriteRecord(WType::UPDATE_TUPLE, tab_name_, rid, *old_rec));
+                ih->delete_entry(old_key.data(), context_ ? context_->txn_ : nullptr);
+                ih->insert_entry(new_key.data(), rid, context_ ? context_->txn_ : nullptr);
             }
         }
         return nullptr;

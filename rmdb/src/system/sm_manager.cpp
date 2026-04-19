@@ -13,11 +13,43 @@ See the Mulan PSL v2 for more details. */
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <cassert>
+#include <cstring>
 #include <fstream>
+#include <sstream>
+#include <unordered_set>
 
+#include "execution/execution_defs.h"
 #include "index/ix.h"
 #include "record/rm.h"
 #include "record_printer.h"
+
+namespace {
+std::string build_index_column_text(const std::vector<ColMeta> &cols) {
+    std::stringstream ss;
+    ss << "(";
+    for (size_t i = 0; i < cols.size(); ++i) {
+        if (i > 0) {
+            ss << ",";
+        }
+        ss << cols[i].name;
+    }
+    ss << ")";
+    return ss.str();
+}
+
+void append_context_line(Context *context, const std::string &line) {
+    if (context == nullptr || context->ellipsis_) {
+        return;
+    }
+    if (*(context->offset_) + line.size() < BUFFER_LENGTH) {
+        std::memcpy(context->data_send_ + *(context->offset_), line.c_str(), line.size());
+        *(context->offset_) += line.size();
+    } else {
+        context->ellipsis_ = true;
+    }
+}
+}  // namespace
 
 /**
  * @description: 判断是否为一个文件夹
@@ -108,8 +140,34 @@ void SmManager::open_db(const std::string& db_name) {
         fhs_.emplace(tab.name, rm_manager_->open_file(tab.name));
     }
 
-    // 当前题目阶段不依赖索引维护，避免触发未完成的B+树写路径
     ihs_.clear();
+    for (auto &entry : db_.tabs_) {
+        auto &tab = entry.second;
+        auto *fh = fhs_.at(tab.name).get();
+        for (auto &index_meta : tab.indexes) {
+            if (!ix_manager_->exists(tab.name, index_meta.cols)) {
+                ix_manager_->create_index(tab.name, index_meta.cols);
+            }
+            std::string ix_name = ix_manager_->get_index_name(tab.name, index_meta.cols);
+            ihs_.emplace(ix_name, ix_manager_->open_index(tab.name, index_meta.cols));
+
+            auto ih_it = ihs_.find(ix_name);
+            assert(ih_it != ihs_.end());
+            auto *ih = ih_it->second.get();
+            std::unique_ptr<RecScan> scan = std::make_unique<RmScan>(fh);
+            for (; !scan->is_end(); scan->next()) {
+                Rid rid = scan->rid();
+                auto rec = fh->get_record(rid, nullptr);
+                std::vector<char> key_buf(index_meta.col_tot_len);
+                make_index_key(index_meta.cols, rec->data, key_buf.data());
+                std::vector<Rid> existing;
+                if (ih->get_value(key_buf.data(), &existing, nullptr)) {
+                    throw RMDBError("Duplicate key exists when rebuilding unique index");
+                }
+                ih->insert_entry(key_buf.data(), rid, nullptr);
+            }
+        }
+    }
 
     // 每次启动服务，重置输出文件
     std::ofstream ofs("output.txt", std::ios::out);
@@ -170,6 +228,29 @@ void SmManager::show_tables(Context* context) {
         outfile << "| " << tab.name << " |\n";
     }
     printer.print_separator(context);
+    outfile.close();
+}
+
+/**
+ * @description: 展示某个表上的索引信息
+ * @param {string&} tab_name 表名称
+ * @param {Context*} context
+ */
+void SmManager::show_index(const std::string& tab_name, Context* context) {
+    if (!db_.is_table(tab_name)) {
+        throw TableNotFoundError(tab_name);
+    }
+
+    auto &tab = db_.get_table(tab_name);
+    std::fstream outfile;
+    outfile.open("output.txt", std::ios::out | std::ios::app);
+
+    for (auto &index : tab.indexes) {
+        std::string cols_text = build_index_column_text(index.cols);
+        std::string line = "| " + tab_name + " | unique | " + cols_text + " |\n";
+        append_context_line(context, line);
+        outfile << line;
+    }
     outfile.close();
 }
 
@@ -272,6 +353,15 @@ void SmManager::create_index(const std::string& tab_name, const std::vector<std:
     if (tab.is_index(col_names)) {
         throw IndexExistsError(tab_name, col_names);
     }
+    if (col_names.empty()) {
+        throw RMDBError("Index column list cannot be empty");
+    }
+    std::unordered_set<std::string> col_name_set;
+    for (auto &col_name : col_names) {
+        if (!col_name_set.insert(col_name).second) {
+            throw RMDBError("Duplicate column in index definition: " + col_name);
+        }
+    }
 
     std::vector<ColMeta> cols;
     int col_tot_len = 0;
@@ -282,9 +372,37 @@ void SmManager::create_index(const std::string& tab_name, const std::vector<std:
         col_tot_len += col->len;
     }
 
+    std::string ix_name = ix_manager_->get_index_name(tab_name, cols);
+    if (ix_manager_->exists(tab_name, cols)) {
+        throw IndexExistsError(tab_name, col_names);
+    }
     ix_manager_->create_index(tab_name, cols);
-    // 框架版本的B+树插入未完整实现，这里仅维护元数据与文件生命周期
-    // 在后续扩展中可在此处补回填索引项逻辑
+
+    std::unique_ptr<IxIndexHandle> ih = ix_manager_->open_index(tab_name, cols);
+    try {
+        auto *fh = fhs_.at(tab_name).get();
+        std::unique_ptr<RecScan> scan = std::make_unique<RmScan>(fh);
+        for (; !scan->is_end(); scan->next()) {
+            Rid rid = scan->rid();
+            auto rec = fh->get_record(rid, context);
+            std::vector<char> key_buf(col_tot_len);
+            make_index_key(cols, rec->data, key_buf.data());
+            std::vector<Rid> existing;
+            if (ih->get_value(key_buf.data(), &existing, context ? context->txn_ : nullptr)) {
+                throw RMDBError("Duplicate key exists, cannot create unique index");
+            }
+            ih->insert_entry(key_buf.data(), rid, context ? context->txn_ : nullptr);
+        }
+    } catch (...) {
+        ix_manager_->close_index(ih.get());
+        ih.reset();
+        if (ix_manager_->exists(tab_name, cols)) {
+            ix_manager_->destroy_index(tab_name, cols);
+        }
+        throw;
+    }
+    ihs_[ix_name] = std::move(ih);
+
     IndexMeta index_meta;
     index_meta.tab_name = tab_name;
     index_meta.col_num = static_cast<int>(cols.size());
@@ -352,4 +470,22 @@ void SmManager::drop_index(const std::string& tab_name, const std::vector<ColMet
         }
     }
     flush_meta();
+}
+
+IxIndexHandle* SmManager::open_index_handle(const std::string& tab_name, const std::vector<ColMeta>& cols) {
+    std::string ix_name = ix_manager_->get_index_name(tab_name, cols);
+    auto ih_it = ihs_.find(ix_name);
+    if (ih_it != ihs_.end()) {
+        return ih_it->second.get();
+    }
+    if (!ix_manager_->exists(tab_name, cols)) {
+        std::vector<std::string> col_names;
+        col_names.reserve(cols.size());
+        for (auto &col : cols) {
+            col_names.push_back(col.name);
+        }
+        throw IndexNotFoundError(tab_name, col_names);
+    }
+    ihs_[ix_name] = ix_manager_->open_index(tab_name, cols);
+    return ihs_[ix_name].get();
 }

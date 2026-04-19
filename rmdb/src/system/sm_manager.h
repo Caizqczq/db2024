@@ -66,6 +66,8 @@ class SmManager {
 
     void show_tables(Context* context);
 
+    void show_index(const std::string& tab_name, Context* context);
+
     void desc_table(const std::string& tab_name, Context* context);
 
     void create_table(const std::string& tab_name, const std::vector<ColDef>& col_defs, Context* context);
@@ -77,4 +79,6 @@ class SmManager {
     void drop_index(const std::string& tab_name, const std::vector<std::string>& col_names, Context* context);
     
     void drop_index(const std::string& tab_name, const std::vector<ColMeta>& col_names, Context* context);
+
+    IxIndexHandle* open_index_handle(const std::string& tab_name, const std::vector<ColMeta>& cols);
 };

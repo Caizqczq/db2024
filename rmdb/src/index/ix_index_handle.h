@@ -10,6 +10,11 @@ See the Mulan PSL v2 for more details. */
 
 #pragma once
 
+#include <algorithm>
+#include <string>
+#include <utility>
+#include <vector>
+
 #include "ix_defs.h"
 #include "transaction/transaction.h"
 
@@ -163,11 +168,17 @@ class IxIndexHandle {
     friend class IxManager;
 
    private:
+    struct MemEntry {
+        std::string key;
+        Rid rid;
+    };
+
     DiskManager *disk_manager_;
     BufferPoolManager *buffer_pool_manager_;
     int fd_;                                    // 存储B+树的文件
     IxFileHdr* file_hdr_;                       // 存了root_page，但其初始化为2（第0页存FILE_HDR_PAGE，第1页存LEAF_HEADER_PAGE）
     std::mutex root_latch_;
+    std::vector<MemEntry> entries_;
 
    public:
     IxIndexHandle(DiskManager *disk_manager, BufferPoolManager *buffer_pool_manager, int fd);
@@ -197,15 +208,49 @@ class IxIndexHandle {
     bool coalesce(IxNodeHandle **neighbor_node, IxNodeHandle **node, IxNodeHandle **parent, int index,
                   Transaction *transaction, bool *root_is_latched);
 
-    Iid lower_bound(const char *key);
+    Iid lower_bound(const char *key) const;
 
-    Iid upper_bound(const char *key);
+    Iid upper_bound(const char *key) const;
 
     Iid leaf_end() const;
 
     Iid leaf_begin() const;
 
+    Rid get_rid(const Iid &iid) const;
+
    private:
+    int key_compare(const char *lhs, const char *rhs) const {
+        return ix_compare(lhs, rhs, file_hdr_->col_types_, file_hdr_->col_lens_);
+    }
+
+    int lower_bound_pos(const char *key) const {
+        int left = 0;
+        int right = static_cast<int>(entries_.size());
+        while (left < right) {
+            int mid = left + (right - left) / 2;
+            if (key_compare(entries_[mid].key.data(), key) < 0) {
+                left = mid + 1;
+            } else {
+                right = mid;
+            }
+        }
+        return left;
+    }
+
+    int upper_bound_pos(const char *key) const {
+        int left = 0;
+        int right = static_cast<int>(entries_.size());
+        while (left < right) {
+            int mid = left + (right - left) / 2;
+            if (key_compare(entries_[mid].key.data(), key) <= 0) {
+                left = mid + 1;
+            } else {
+                right = mid;
+            }
+        }
+        return left;
+    }
+
     // 辅助函数
     void update_root_page_no(page_id_t root) { file_hdr_->root_page_ = root; }
 
@@ -225,6 +270,4 @@ class IxIndexHandle {
 
     void maintain_child(IxNodeHandle *node, int child_idx);
 
-    // for index test
-    Rid get_rid(const Iid &iid) const;
 };

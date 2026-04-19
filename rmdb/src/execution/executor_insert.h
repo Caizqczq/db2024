@@ -53,23 +53,20 @@ class InsertExecutor : public AbstractExecutor {
             val.init_raw(col.len);
             memcpy(rec.data + col.offset, val.raw->data, col.len);
         }
+
         // Insert into record file
         rid_ = fh_->insert_record(rec.data, context_);
+        if (context_->txn_ != nullptr) {
+            context_->txn_->append_write_record(new WriteRecord(WType::INSERT_TUPLE, tab_name_, rid_));
+        }
         
         // Insert into index
         for(size_t i = 0; i < tab_.indexes.size(); ++i) {
             auto& index = tab_.indexes[i];
-            auto ih_it = sm_manager_->ihs_.find(sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols));
-            if (ih_it == sm_manager_->ihs_.end()) {
-                continue;
-            }
+            auto *ih = sm_manager_->open_index_handle(tab_name_, index.cols);
             std::vector<char> key(index.col_tot_len);
             make_index_key(index.cols, rec.data, key.data());
-            ih_it->second->insert_entry(key.data(), rid_, context_->txn_);
-        }
-
-        if (context_->txn_ != nullptr) {
-            context_->txn_->append_write_record(new WriteRecord(WType::INSERT_TUPLE, tab_name_, rid_));
+            ih->insert_entry(key.data(), rid_, context_ ? context_->txn_ : nullptr);
         }
         return nullptr;
     }

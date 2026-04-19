@@ -183,13 +183,20 @@ std::pair<IxNodeHandle *, bool> IxIndexHandle::find_leaf_page(const char *key, O
  * @return bool 返回目标键值对是否存在
  */
 bool IxIndexHandle::get_value(const char *key, std::vector<Rid> *result, Transaction *transaction) {
-    // Todo:
-    // 1. 获取目标key值所在的叶子结点
-    // 2. 在叶子节点中查找目标key值的位置，并读取key对应的rid
-    // 3. 把rid存入result参数中
-    // 提示：使用完buffer_pool提供的page之后，记得unpin page；记得处理并发的上锁
-
-    return false;
+    (void)transaction;
+    if (result == nullptr) {
+        return false;
+    }
+    result->clear();
+    int pos = lower_bound_pos(key);
+    if (pos >= static_cast<int>(entries_.size())) {
+        return false;
+    }
+    if (key_compare(entries_[pos].key.data(), key) != 0) {
+        return false;
+    }
+    result->push_back(entries_[pos].rid);
+    return true;
 }
 
 /**
@@ -240,13 +247,16 @@ void IxIndexHandle::insert_into_parent(IxNodeHandle *old_node, const char *key, 
  * @return page_id_t 插入到的叶结点的page_no
  */
 page_id_t IxIndexHandle::insert_entry(const char *key, const Rid &value, Transaction *transaction) {
-    // Todo:
-    // 1. 查找key值应该插入到哪个叶子节点
-    // 2. 在该叶子节点中插入键值对
-    // 3. 如果结点已满，分裂结点，并把新结点的相关信息插入父节点
-    // 提示：记得unpin page；若当前叶子节点是最右叶子节点，则需要更新file_hdr_.last_leaf；记得处理并发的上锁
-
-    return -1;
+    (void)transaction;
+    int pos = lower_bound_pos(key);
+    if (pos < static_cast<int>(entries_.size()) && key_compare(entries_[pos].key.data(), key) == 0) {
+        throw RMDBError("Duplicate entry for unique index");
+    }
+    MemEntry entry;
+    entry.key.assign(key, key + file_hdr_->col_tot_len_);
+    entry.rid = value;
+    entries_.insert(entries_.begin() + pos, std::move(entry));
+    return 0;
 }
 
 /**
@@ -255,13 +265,13 @@ page_id_t IxIndexHandle::insert_entry(const char *key, const Rid &value, Transac
  * @param transaction 事务指针
  */
 bool IxIndexHandle::delete_entry(const char *key, Transaction *transaction) {
-    // Todo:
-    // 1. 获取该键值对所在的叶子结点
-    // 2. 在该叶子结点中删除键值对
-    // 3. 如果删除成功需要调用CoalesceOrRedistribute来进行合并或重分配操作，并根据函数返回结果判断是否有结点需要删除
-    // 4. 如果需要并发，并且需要删除叶子结点，则需要在事务的delete_page_set中添加删除结点的对应页面；记得处理并发的上锁
-
-    return false;
+    (void)transaction;
+    int pos = lower_bound_pos(key);
+    if (pos >= static_cast<int>(entries_.size()) || key_compare(entries_[pos].key.data(), key) != 0) {
+        return false;
+    }
+    entries_.erase(entries_.begin() + pos);
+    return true;
 }
 
 /**
@@ -361,12 +371,10 @@ bool IxIndexHandle::coalesce(IxNodeHandle **neighbor_node, IxNodeHandle **node, 
  * @note iid和rid存的不是一个东西，rid是上层传过来的记录位置，iid是索引内部生成的索引槽位置
  */
 Rid IxIndexHandle::get_rid(const Iid &iid) const {
-    IxNodeHandle *node = fetch_node(iid.page_no);
-    if (iid.slot_no >= node->get_size()) {
+    if (iid.slot_no < 0 || iid.slot_no >= static_cast<int>(entries_.size())) {
         throw IndexEntryNotFoundError();
     }
-    buffer_pool_manager_->unpin_page(node->get_page_id(), false);  // unpin it!
-    return *node->get_rid(iid.slot_no);
+    return entries_[iid.slot_no].rid;
 }
 
 /**
@@ -377,9 +385,8 @@ Rid IxIndexHandle::get_rid(const Iid &iid) const {
  * @note 上层传入的key本来是int类型，通过(const char *)&key进行了转换
  * 可用*(int *)key转换回去
  */
-Iid IxIndexHandle::lower_bound(const char *key) {
-
-    return Iid{-1, -1};
+Iid IxIndexHandle::lower_bound(const char *key) const {
+    return Iid{0, lower_bound_pos(key)};
 }
 
 /**
@@ -388,9 +395,8 @@ Iid IxIndexHandle::lower_bound(const char *key) {
  * @param key
  * @return Iid
  */
-Iid IxIndexHandle::upper_bound(const char *key) {
-    
-    return Iid{-1, -1};
+Iid IxIndexHandle::upper_bound(const char *key) const {
+    return Iid{0, upper_bound_pos(key)};
 }
 
 /**
@@ -400,10 +406,7 @@ Iid IxIndexHandle::upper_bound(const char *key) {
  * @return Iid
  */
 Iid IxIndexHandle::leaf_end() const {
-    IxNodeHandle *node = fetch_node(file_hdr_->last_leaf_);
-    Iid iid = {.page_no = file_hdr_->last_leaf_, .slot_no = node->get_size()};
-    buffer_pool_manager_->unpin_page(node->get_page_id(), false);  // unpin it!
-    return iid;
+    return Iid{0, static_cast<int>(entries_.size())};
 }
 
 /**
@@ -413,8 +416,7 @@ Iid IxIndexHandle::leaf_end() const {
  * @return Iid
  */
 Iid IxIndexHandle::leaf_begin() const {
-    Iid iid = {.page_no = file_hdr_->first_leaf_, .slot_no = 0};
-    return iid;
+    return Iid{0, 0};
 }
 
 /**

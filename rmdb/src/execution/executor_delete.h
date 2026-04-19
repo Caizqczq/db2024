@@ -40,14 +40,10 @@ class DeleteExecutor : public AbstractExecutor {
         for (auto &rid : rids_) {
             auto rec = fh_->get_record(rid, context_);
             for (auto &index : tab_.indexes) {
-                std::string ix_name = sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols);
-                auto ih_it = sm_manager_->ihs_.find(ix_name);
-                if (ih_it == sm_manager_->ihs_.end()) {
-                    continue;
-                }
+                auto *ih = sm_manager_->open_index_handle(tab_name_, index.cols);
                 std::vector<char> key_buf(index.col_tot_len);
                 make_index_key(index.cols, rec->data, key_buf.data());
-                ih_it->second->delete_entry(key_buf.data(), context_->txn_);
+                ih->delete_entry(key_buf.data(), context_ ? context_->txn_ : nullptr);
             }
 
             fh_->delete_record(rid, context_);

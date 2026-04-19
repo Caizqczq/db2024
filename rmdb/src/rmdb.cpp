@@ -120,6 +120,7 @@ void *client_handler(void *sock_fd) {
 
         // 用于判断是否已经调用了yy_delete_buffer来删除buf
         bool finish_analyze = false;
+        bool statement_failed = false;
         pthread_mutex_lock(buffer_mutex);
         YY_BUFFER_STATE buf = yy_scan_string(data_recv);
         if (yyparse() == 0) {
@@ -142,6 +143,7 @@ void *client_handler(void *sock_fd) {
                     memcpy(data_send, str.c_str(), str.length());
                     data_send[str.length()] = '\0';
                     offset = str.length();
+                    statement_failed = true;
 
                     // 回滚事务
                     txn_manager->abort(context->txn_, log_manager.get());
@@ -154,6 +156,10 @@ void *client_handler(void *sock_fd) {
                 } catch (RMDBError &e) {
                     // 遇到异常，需要打印failure到output.txt文件中，并发异常信息返回给客户端
                     std::cerr << e.what() << std::endl;
+                    statement_failed = true;
+
+                    // 由事务管理器负责回滚当前语句产生的副作用
+                    txn_manager->abort(context->txn_, context->log_mgr_);
 
                     memcpy(data_send, e.what(), e.get_msg_len());
                     data_send[e.get_msg_len()] = '\n';
@@ -178,7 +184,7 @@ void *client_handler(void *sock_fd) {
             break;
         }
         // 如果是单挑语句，需要按照一个完整的事务来执行，所以执行完当前语句后，自动提交事务
-        if(context->txn_->get_txn_mode() == false)
+        if(!statement_failed && context->txn_->get_txn_mode() == false)
         {
             txn_manager->commit(context->txn_, context->log_mgr_);
         }
