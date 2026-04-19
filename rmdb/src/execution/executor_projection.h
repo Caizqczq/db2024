@@ -21,6 +21,21 @@ class ProjectionExecutor : public AbstractExecutor {
     std::vector<ColMeta> cols_;                     // 需要投影的字段
     size_t len_;                                    // 字段总长度
     std::vector<size_t> sel_idxs_;                  
+    std::unique_ptr<RmRecord> current_tuple_;
+
+    void build_current_tuple() {
+        if (prev_->is_end()) {
+            current_tuple_.reset();
+            return;
+        }
+        auto src = prev_->Next();
+        current_tuple_ = std::make_unique<RmRecord>(len_);
+        auto &prev_cols = prev_->cols();
+        for (size_t i = 0; i < cols_.size(); i++) {
+            const auto &src_col = prev_cols[sel_idxs_[i]];
+            std::memcpy(current_tuple_->data + cols_[i].offset, src->data + src_col.offset, src_col.len);
+        }
+    }
 
    public:
     ProjectionExecutor(std::unique_ptr<AbstractExecutor> prev, const std::vector<TabCol> &sel_cols) {
@@ -39,13 +54,32 @@ class ProjectionExecutor : public AbstractExecutor {
         len_ = curr_offset;
     }
 
-    void beginTuple() override {}
-
-    void nextTuple() override {}
-
-    std::unique_ptr<RmRecord> Next() override {
-        return nullptr;
+    void beginTuple() override {
+        prev_->beginTuple();
+        build_current_tuple();
     }
 
-    Rid &rid() override { return _abstract_rid; }
+    void nextTuple() override {
+        prev_->nextTuple();
+        build_current_tuple();
+    }
+
+    std::unique_ptr<RmRecord> Next() override {
+        if (current_tuple_ == nullptr) {
+            return nullptr;
+        }
+        return std::make_unique<RmRecord>(*current_tuple_);
+    }
+
+    bool is_end() const override { return prev_->is_end(); }
+
+    size_t tupleLen() const override { return len_; }
+
+    const std::vector<ColMeta> &cols() const override { return cols_; }
+
+    ColMeta get_col_offset(const TabCol &target) override { return *get_col(cols_, target); }
+
+    std::string getType() override { return "ProjectionExecutor"; }
+
+    Rid &rid() override { return prev_->rid(); }
 };

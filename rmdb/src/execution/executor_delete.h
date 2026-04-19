@@ -37,6 +37,24 @@ class DeleteExecutor : public AbstractExecutor {
     }
 
     std::unique_ptr<RmRecord> Next() override {
+        for (auto &rid : rids_) {
+            auto rec = fh_->get_record(rid, context_);
+            for (auto &index : tab_.indexes) {
+                std::string ix_name = sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols);
+                auto ih_it = sm_manager_->ihs_.find(ix_name);
+                if (ih_it == sm_manager_->ihs_.end()) {
+                    continue;
+                }
+                std::vector<char> key_buf(index.col_tot_len);
+                make_index_key(index.cols, rec->data, key_buf.data());
+                ih_it->second->delete_entry(key_buf.data(), context_->txn_);
+            }
+
+            fh_->delete_record(rid, context_);
+            if (context_->txn_ != nullptr) {
+                context_->txn_->append_write_record(new WriteRecord(WType::DELETE_TUPLE, tab_name_, rid, *rec));
+            }
+        }
         return nullptr;
     }
 

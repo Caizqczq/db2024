@@ -65,16 +65,51 @@ class IndexScanExecutor : public AbstractExecutor {
     }
 
     void beginTuple() override {
-        
+        // 框架最小实现：在缺乏完整B+树接口时，退化为过滤式全表扫描。
+        scan_ = std::make_unique<RmScan>(fh_);
+        while (!scan_->is_end()) {
+            Rid curr_rid = scan_->rid();
+            auto rec = fh_->get_record(curr_rid, context_);
+            if (eval_conditions(fed_conds_, cols_, rec->data)) {
+                rid_ = curr_rid;
+                return;
+            }
+            scan_->next();
+        }
     }
 
     void nextTuple() override {
-        
+        if (scan_ == nullptr || scan_->is_end()) {
+            return;
+        }
+        scan_->next();
+        while (!scan_->is_end()) {
+            Rid curr_rid = scan_->rid();
+            auto rec = fh_->get_record(curr_rid, context_);
+            if (eval_conditions(fed_conds_, cols_, rec->data)) {
+                rid_ = curr_rid;
+                return;
+            }
+            scan_->next();
+        }
     }
 
     std::unique_ptr<RmRecord> Next() override {
-        return nullptr;
+        if (scan_ == nullptr || scan_->is_end()) {
+            return nullptr;
+        }
+        return fh_->get_record(rid_, context_);
     }
+
+    bool is_end() const override { return scan_ == nullptr || scan_->is_end(); }
+
+    size_t tupleLen() const override { return len_; }
+
+    const std::vector<ColMeta> &cols() const override { return cols_; }
+
+    ColMeta get_col_offset(const TabCol &target) override { return *get_col(cols_, target); }
+
+    std::string getType() override { return "IndexScanExecutor"; }
 
     Rid &rid() override { return rid_; }
 };

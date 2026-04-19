@@ -24,6 +24,31 @@ class NestedLoopJoinExecutor : public AbstractExecutor {
 
     std::vector<Condition> fed_conds_;          // join条件
     bool isend;
+    std::unique_ptr<RmRecord> current_tuple_;
+
+    void find_next_valid_tuple() {
+        while (!left_->is_end()) {
+            while (!right_->is_end()) {
+                auto left_tuple = left_->Next();
+                auto right_tuple = right_->Next();
+                auto joined = std::make_unique<RmRecord>(len_);
+                std::memcpy(joined->data, left_tuple->data, left_->tupleLen());
+                std::memcpy(joined->data + left_->tupleLen(), right_tuple->data, right_->tupleLen());
+                if (eval_conditions(fed_conds_, cols_, joined->data)) {
+                    current_tuple_ = std::move(joined);
+                    isend = false;
+                    return;
+                }
+                right_->nextTuple();
+            }
+            left_->nextTuple();
+            if (!left_->is_end()) {
+                right_->beginTuple();
+            }
+        }
+        current_tuple_.reset();
+        isend = true;
+    }
 
    public:
     NestedLoopJoinExecutor(std::unique_ptr<AbstractExecutor> left, std::unique_ptr<AbstractExecutor> right, 
@@ -44,16 +69,40 @@ class NestedLoopJoinExecutor : public AbstractExecutor {
     }
 
     void beginTuple() override {
-
+        left_->beginTuple();
+        if (left_->is_end()) {
+            isend = true;
+            current_tuple_.reset();
+            return;
+        }
+        right_->beginTuple();
+        find_next_valid_tuple();
     }
 
     void nextTuple() override {
-        
+        if (isend) {
+            return;
+        }
+        right_->nextTuple();
+        find_next_valid_tuple();
     }
 
     std::unique_ptr<RmRecord> Next() override {
-        return nullptr;
+        if (isend || current_tuple_ == nullptr) {
+            return nullptr;
+        }
+        return std::make_unique<RmRecord>(*current_tuple_);
     }
+
+    bool is_end() const override { return isend; }
+
+    size_t tupleLen() const override { return len_; }
+
+    const std::vector<ColMeta> &cols() const override { return cols_; }
+
+    ColMeta get_col_offset(const TabCol &target) override { return *get_col(cols_, target); }
+
+    std::string getType() override { return "NestedLoopJoinExecutor"; }
 
     Rid &rid() override { return _abstract_rid; }
 };

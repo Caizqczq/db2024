@@ -11,6 +11,7 @@ See the Mulan PSL v2 for more details. */
 #include "transaction_manager.h"
 #include "record/rm_file_handle.h"
 #include "system/sm_manager.h"
+#include "execution/execution_defs.h"
 
 std::unordered_map<txn_id_t, Transaction *> TransactionManager::txn_map = {};
 
@@ -21,13 +22,15 @@ std::unordered_map<txn_id_t, Transaction *> TransactionManager::txn_map = {};
  * @param {LogManager*} log_manager 日志管理器指针
  */
 Transaction * TransactionManager::begin(Transaction* txn, LogManager* log_manager) {
-    // Todo:
-    // 1. 判断传入事务参数是否为空指针
-    // 2. 如果为空指针，创建新事务
-    // 3. 把开始事务加入到全局事务表中
-    // 4. 返回当前事务指针
-    
-    return nullptr;
+    (void)log_manager;
+    std::unique_lock<std::mutex> lock(latch_);
+    if (txn == nullptr) {
+        txn = new Transaction(next_txn_id_++, IsolationLevel::SERIALIZABLE);
+    }
+    txn->set_state(TransactionState::GROWING);
+    txn->set_start_ts(next_timestamp_++);
+    TransactionManager::txn_map[txn->get_transaction_id()] = txn;
+    return txn;
 }
 
 /**
@@ -36,13 +39,26 @@ Transaction * TransactionManager::begin(Transaction* txn, LogManager* log_manage
  * @param {LogManager*} log_manager 日志管理器指针
  */
 void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
-    // Todo:
-    // 1. 如果存在未提交的写操作，提交所有的写操作
-    // 2. 释放所有锁
-    // 3. 释放事务相关资源，eg.锁集
-    // 4. 把事务日志刷入磁盘中
-    // 5. 更新事务状态
+    if (txn == nullptr) {
+        return;
+    }
 
+    auto write_set = txn->get_write_set();
+    for (auto *write_record : *write_set) {
+        delete write_record;
+    }
+    write_set->clear();
+
+    auto lock_set = txn->get_lock_set();
+    for (auto &lock_data_id : *lock_set) {
+        lock_manager_->unlock(txn, lock_data_id);
+    }
+    lock_set->clear();
+
+    txn->set_state(TransactionState::COMMITTED);
+    if (log_manager != nullptr) {
+        log_manager->flush_log_to_disk();
+    }
 }
 
 /**
@@ -51,11 +67,80 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
  * @param {LogManager} *log_manager 日志管理器指针
  */
 void TransactionManager::abort(Transaction * txn, LogManager *log_manager) {
-    // Todo:
-    // 1. 回滚所有写操作
-    // 2. 释放所有锁
-    // 3. 清空事务相关资源，eg.锁集
-    // 4. 把事务日志刷入磁盘中
-    // 5. 更新事务状态
-    
+    if (txn == nullptr) {
+        return;
+    }
+
+    auto write_set = txn->get_write_set();
+    for (auto it = write_set->rbegin(); it != write_set->rend(); ++it) {
+        auto *write_record = *it;
+        auto &tab_name = write_record->GetTableName();
+        auto &rid = write_record->GetRid();
+        auto fh = sm_manager_->fhs_.at(tab_name).get();
+        auto &tab = sm_manager_->db_.get_table(tab_name);
+
+        if (write_record->GetWriteType() == WType::INSERT_TUPLE) {
+            // undo insert: 删除该记录并清理索引项
+            auto rec = fh->get_record(rid, nullptr);
+            for (auto &index : tab.indexes) {
+                std::string ix_name = sm_manager_->get_ix_manager()->get_index_name(tab_name, index.cols);
+                auto ih_it = sm_manager_->ihs_.find(ix_name);
+                if (ih_it == sm_manager_->ihs_.end()) {
+                    continue;
+                }
+                std::vector<char> key_buf(index.col_tot_len);
+                make_index_key(index.cols, rec->data, key_buf.data());
+                ih_it->second->delete_entry(key_buf.data(), txn);
+            }
+            fh->delete_record(rid, nullptr);
+        } else if (write_record->GetWriteType() == WType::DELETE_TUPLE) {
+            // undo delete: 把旧记录插回原位置并恢复索引项
+            auto &old_rec = write_record->GetRecord();
+            fh->insert_record(rid, old_rec.data);
+            for (auto &index : tab.indexes) {
+                std::string ix_name = sm_manager_->get_ix_manager()->get_index_name(tab_name, index.cols);
+                auto ih_it = sm_manager_->ihs_.find(ix_name);
+                if (ih_it == sm_manager_->ihs_.end()) {
+                    continue;
+                }
+                std::vector<char> key_buf(index.col_tot_len);
+                make_index_key(index.cols, old_rec.data, key_buf.data());
+                ih_it->second->insert_entry(key_buf.data(), rid, txn);
+            }
+        } else if (write_record->GetWriteType() == WType::UPDATE_TUPLE) {
+            // undo update: 恢复旧值，并更新受影响的索引项
+            auto curr_rec = fh->get_record(rid, nullptr);
+            auto &old_rec = write_record->GetRecord();
+            for (auto &index : tab.indexes) {
+                std::string ix_name = sm_manager_->get_ix_manager()->get_index_name(tab_name, index.cols);
+                auto ih_it = sm_manager_->ihs_.find(ix_name);
+                if (ih_it == sm_manager_->ihs_.end()) {
+                    continue;
+                }
+                std::vector<char> curr_key(index.col_tot_len);
+                std::vector<char> old_key(index.col_tot_len);
+                make_index_key(index.cols, curr_rec->data, curr_key.data());
+                make_index_key(index.cols, old_rec.data, old_key.data());
+                if (std::memcmp(curr_key.data(), old_key.data(), index.col_tot_len) != 0) {
+                    ih_it->second->delete_entry(curr_key.data(), txn);
+                    ih_it->second->insert_entry(old_key.data(), rid, txn);
+                }
+            }
+            fh->update_record(rid, old_rec.data, nullptr);
+        }
+
+        delete write_record;
+    }
+    write_set->clear();
+
+    auto lock_set = txn->get_lock_set();
+    for (auto &lock_data_id : *lock_set) {
+        lock_manager_->unlock(txn, lock_data_id);
+    }
+    lock_set->clear();
+
+    txn->set_state(TransactionState::ABORTED);
+    if (log_manager != nullptr) {
+        log_manager->flush_log_to_disk();
+    }
 }
